@@ -16,6 +16,25 @@ class Mode(Enum):
 
 @dataclasses.dataclass
 class Frame:
+    """
+    一帧图像与其关联数据的容器（最小处理单元）。
+
+    字段说明：
+    - frame_id: 数据集中该帧的索引/编号。
+    - img: 预处理后的张量图像（通常为网络输入），形状 [3, H, W]。
+    - img_shape: 下采样/裁剪后的有效分辨率（H, W）。
+    - img_true_shape: 原图的真实分辨率（用于可视化/反投影等）。
+    - uimg: 未归一化的图像（0~1），常用于UI/可视化。
+    - T_WC: 世界到相机的位姿（Sim3，含尺度），默认单位阵。
+    - X_canon: 该帧的“规范点图”（按像素展平后的3D点，单位方向或带尺度）。
+    - C: 与 X_canon 对应的一维置信度（逐点）。
+    - feat: 稀疏特征（例如每 16x16 patch 的特征向量）。
+    - pos: 特征对应的二维网格位置索引（与 feat 对齐）。
+    - N: 聚合计数（点图融合时用于统计/平均）。
+    - N_updates: 该帧点图被更新的次数（根据 filtering_mode 决定写入策略）。
+    - K: 相机内参（仅在 use_calib=True 时使用）。
+    """
+
     frame_id: int
     img: torch.Tensor
     img_shape: torch.Tensor
@@ -31,17 +50,31 @@ class Frame:
     K: Optional[torch.Tensor] = None
 
     def get_score(self, C):
+        """根据配置选择聚合评分方式，用于 best_score 模式的比较。"""
         filtering_score = config["tracking"]["filtering_score"]
         if filtering_score == "median":
-            score = torch.median(C)  # Is this slower than mean? Is it worth it?
+            # 原注释：Is this slower than mean? Is it worth it?
+            # 译：比均值更慢吗？值不值得？（中值更鲁棒，但可能更耗时）
+            score = torch.median(C)
         elif filtering_score == "mean":
             score = torch.mean(C)
         return score
 
     def update_pointmap(self, X: torch.Tensor, C: torch.Tensor):
+        """
+        按“点图融合策略”更新该帧的规范点图与置信度。
+        可选策略（config.tracking.filtering_mode）：
+        - first：只在第一次更新时写入（其后保持不变）。
+        - recent：始终以最新观测覆盖（更跟随当前，但不稳）。
+        - best_score：比较 C 的汇总分数（均值/中值），更优者覆盖。
+        - indep_conf：逐点比较置信度，更高者逐点替换。
+        - weighted_pointmap：对点与置信度按权重做加权平均（逐点）。
+        - weighted_spherical：先做笛卡尔->球坐标加权，再还原。
+        """
         filtering_mode = config["tracking"]["filtering_mode"]
 
         if self.N == 0:
+            # 首次写入：直接克隆保存，并初始化计数
             self.X_canon = X.clone()
             self.C = C.clone()
             self.N = 1
@@ -51,15 +84,18 @@ class Frame:
             return
 
         if filtering_mode == "first":
+            # 仅保留“第一次”的观测
             if self.N_updates == 1:
                 self.X_canon = X.clone()
                 self.C = C.clone()
                 self.N = 1
         elif filtering_mode == "recent":
+            # 始终使用最新结果覆盖
             self.X_canon = X.clone()
             self.C = C.clone()
             self.N = 1
         elif filtering_mode == "best_score":
+            # 依据整体分数比较，优者为王
             new_score = self.get_score(C)
             if new_score > self.score:
                 self.X_canon = X.clone()
@@ -67,25 +103,30 @@ class Frame:
                 self.N = 1
                 self.score = new_score
         elif filtering_mode == "indep_conf":
+            # 逐像素独立比较置信度：新更高则逐点替换
             new_mask = C > self.C
             self.X_canon[new_mask.repeat(1, 3)] = X[new_mask.repeat(1, 3)]
             self.C[new_mask] = C[new_mask]
             self.N = 1
         elif filtering_mode == "weighted_pointmap":
+            # 逐点做加权平均（C 作为权重）
             self.X_canon = ((self.C * self.X_canon) + (C * X)) / (self.C + C)
             self.C = self.C + C
             self.N += 1
         elif filtering_mode == "weighted_spherical":
+            # 在球坐标系中加权，可在方向性强的场景更稳定
 
             def cartesian_to_spherical(P):
+                # 将 (x, y, z) 转为 (r, phi, theta)
                 r = torch.linalg.norm(P, dim=-1, keepdim=True)
                 x, y, z = torch.tensor_split(P, 3, dim=-1)
-                phi = torch.atan2(y, x)
-                theta = torch.acos(z / r)
+                phi = torch.atan2(y, x)  # 方位角 φ ∈ (-π, π]
+                theta = torch.acos(z / r)  # 极角 θ ∈ [0, π]
                 spherical = torch.cat((r, phi, theta), dim=-1)
                 return spherical
 
             def spherical_to_cartesian(spherical):
+                # (r, phi, theta) 还原回 (x, y, z)
                 r, phi, theta = torch.tensor_split(spherical, 3, dim=-1)
                 x = r * torch.sin(theta) * torch.cos(phi)
                 y = r * torch.sin(theta) * torch.sin(phi)
@@ -101,21 +142,30 @@ class Frame:
             self.C = self.C + C
             self.N += 1
 
+        # 更新计数器：记录该帧点图被写入的次数
         self.N_updates += 1
         return
 
     def get_average_conf(self):
+        """返回平均置信度（若尚无 C 则返回 None）。"""
         return self.C / self.N if self.C is not None else None
 
 
 def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
-    img = resize_img(img, img_size)
+    """
+    工厂函数：从原始图像字典构造 Frame。
+    - 负责按配置缩放到固定分辨率（img_size），并保留真值尺寸。
+    - 根据 dataset.img_downsample 进一步做整数下采样（影响 uimg 与 img_shape）。
+    - 将位姿 T_WC（Sim3）一并写入 Frame。
+    """
+    img = resize_img(img, img_size)  # 外部工具：返回 dict {img, true_shape, unnormalized_img}
     rgb = img["img"].to(device=device)
     img_shape = torch.tensor(img["true_shape"], device=device)
     img_true_shape = img_shape.clone()
-    uimg = torch.from_numpy(img["unnormalized_img"]) / 255.0
+    uimg = torch.from_numpy(img["unnormalized_img"]) / 255.0  # 转为 0~1 浮点
     downsample = config["dataset"]["img_downsample"]
     if downsample > 1:
+        # 对未归一化图像与 shape 一致地下采样
         uimg = uimg[::downsample, ::downsample]
         img_shape = img_shape // downsample
     frame = Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC)
@@ -123,24 +173,32 @@ def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
 
 
 class SharedStates:
+    """
+    进程/线程间共享的“当前帧状态”。
+    - 使用 multiprocessing.Manager 创建的共享内存/同步原语。
+    - 主要用于重定位（RELOC）、可视化以及某些异步模块读取当前帧信息。
+    - 图像以 GPU 张量存放（.share_memory_），uimg 放在 CPU 便于UI访问。
+    """
+
     def __init__(self, manager, h, w, dtype=torch.float32, device="cuda"):
         self.h, self.w = h, w
         self.dtype = dtype
         self.device = device
 
-        self.lock = manager.RLock()
-        self.paused = manager.Value("i", 0)
-        self.mode = manager.Value("i", Mode.INIT)
-        self.reloc_sem = manager.Value("i", 0)
-        self.global_optimizer_tasks = manager.list()
-        self.edges_ii = manager.list()
+        self.lock = manager.RLock()  # 读写锁，保护一致性
+        self.paused = manager.Value("i", 0)  # 是否暂停（0/1）
+        self.mode = manager.Value("i", Mode.INIT)  # 当前运行模式
+        self.reloc_sem = manager.Value("i", 0)  # 重定位“信号量”
+        self.global_optimizer_tasks = manager.list()  # 全局优化任务队列（索引）
+        self.edges_ii = manager.list()  # 可能用于图优化的边集合
         self.edges_jj = manager.list()
 
         self.feat_dim = 1024
-        self.num_patches = h * w // (16 * 16)
+        self.num_patches = h * w // (16 * 16)  # 假设每 16x16 取一个 patch
 
         # fmt:off
-        # shared state for the current frame (used for reloc/visualization)
+        # 原注释：shared state for the current frame (used for reloc/visualization)
+        # 译：当前帧的共享状态（用于重定位/可视化）
         self.dataset_idx = torch.zeros(1, device=device, dtype=torch.int).share_memory_()
         self.img = torch.zeros(3, h, w, device=device, dtype=dtype).share_memory_()
         self.uimg = torch.zeros(h, w, 3, device="cpu", dtype=dtype).share_memory_()
@@ -154,6 +212,7 @@ class SharedStates:
         # fmt: on
 
     def set_frame(self, frame):
+        """把一个 Frame 的数据写入共享缓冲（供其他进程读取）。"""
         with self.lock:
             self.dataset_idx[:] = frame.frame_id
             self.img[:] = frame.img
@@ -167,6 +226,7 @@ class SharedStates:
             self.pos[:] = frame.pos
 
     def get_frame(self):
+        """从共享缓冲构造一个新的 Frame（浅拷贝视图为主）。"""
         with self.lock:
             frame = Frame(
                 int(self.dataset_idx[0]),
@@ -183,14 +243,17 @@ class SharedStates:
             return frame
 
     def queue_global_optimization(self, idx):
+        """将关键帧索引加入全局优化任务队列。"""
         with self.lock:
             self.global_optimizer_tasks.append(idx)
 
     def queue_reloc(self):
+        """发出一次重定位请求（计数+1）。"""
         with self.lock:
             self.reloc_sem.value += 1
 
     def dequeue_reloc(self):
+        """消耗一次重定位请求（计数-1，若为0则不动）。"""
         with self.lock:
             if self.reloc_sem.value == 0:
                 return
@@ -218,6 +281,13 @@ class SharedStates:
 
 
 class SharedKeyframes:
+    """
+    关键帧环形缓冲（共享内存版本）。
+    - 支持 __getitem__/__setitem__ 以 Frame 视图的形式读写。
+    - 内部维护 n_size 作为有效长度，buffer 为最大容量。
+    - 存放关键帧图像/点图/特征/位姿等，用于跟踪与全局优化。
+    """
+
     def __init__(self, manager, h, w, buffer=512, dtype=torch.float32, device="cuda"):
         self.lock = manager.RLock()
         self.n_size = manager.Value("i", 0)
@@ -249,7 +319,8 @@ class SharedKeyframes:
 
     def __getitem__(self, idx) -> Frame:
         with self.lock:
-            # put all of the data into a frame
+            # 原注释：put all of the data into a frame
+            # 译：把数组切片打包成一个 Frame 返回
             kf = Frame(
                 int(self.dataset_idx[idx]),
                 self.img[idx],
@@ -272,7 +343,8 @@ class SharedKeyframes:
         with self.lock:
             self.n_size.value = max(idx + 1, self.n_size.value)
 
-            # set the attributes
+            # 原注释：set the attributes
+            # 译：把 Frame 的各字段写回共享缓冲中对应位置
             self.dataset_idx[idx] = value.frame_id
             self.img[idx] = value.img
             self.uimg[idx] = value.uimg
@@ -285,7 +357,7 @@ class SharedKeyframes:
             self.pos[idx] = value.pos
             self.N[idx] = value.N
             self.N_updates[idx] = value.N_updates
-            self.is_dirty[idx] = True
+            self.is_dirty[idx] = True  # 标记该关键帧已被更新，便于异步消费
             return idx
 
     def __len__(self):
