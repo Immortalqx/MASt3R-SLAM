@@ -11,6 +11,7 @@ from mast3r_slam.config import config
 import mast3r_slam.matching as matching
 
 
+# main.py使用，载入 MASt3R 模型
 def load_mast3r(path=None, device="cuda"):
     """
     加载 MASt3R 主模型（AsymmetricMASt3R）并移动到指定设备。
@@ -31,6 +32,7 @@ def load_mast3r(path=None, device="cuda"):
     return model
 
 
+# main.py使用，run_backend函数开头调用一次，随后进入backend循环
 def load_retriever(mast3r_model, retriever_path=None, device="cuda"):
     """
     加载检索数据库（RetrievalDatabase），供全局/局部回环或候选对选择时使用。
@@ -52,6 +54,7 @@ def load_retriever(mast3r_model, retriever_path=None, device="cuda"):
     return retriever
 
 
+# 仅在本文件mast3r_utils.py中使用
 @torch.inference_mode
 def decoder(model, feat1, feat2, pos1, pos2, shape1, shape2):
     """
@@ -76,6 +79,7 @@ def decoder(model, feat1, feat2, pos1, pos2, shape1, shape2):
     return res1, res2
 
 
+# 仅在本文件mast3r_utils.py中使用
 def downsample(X, C, D, Q):
     """
     按配置 `dataset.img_downsample` 对四类张量做**整型步长下采样**。
@@ -102,47 +106,7 @@ def downsample(X, C, D, Q):
     return X, C, D, Q
 
 
-@torch.inference_mode
-def mast3r_symmetric_inference(model, frame_i, frame_j):
-    """
-    **对称推理**：对帧 i 与 j 双向解码，得到 `(i→j)` 与 `(j→i)` 两个方向的预测。
-
-    步骤：
-    - 若帧尚未编码，则调用 `model._encode_image(img, true_shape)` 得到 `(feat, pos)`；
-    - 通过 `decoder` 两次：`(feat_i, feat_j)` 与 `(feat_j, feat_i)`；
-    - 将 4 份输出堆叠为张量 `X, C, D, Q ∈ R^{4×H×W×...}`；
-    - 调用 `downsample` 按配置做子采样。
-
-    返回：
-    - X, C, D, Q：形状均为 `4×H×W×(F)` 或 `4×H×W`。
-    """
-    if frame_i.feat is None:
-        frame_i.feat, frame_i.pos, _ = model._encode_image(
-            frame_i.img, frame_i.img_true_shape
-        )
-    if frame_j.feat is None:
-        frame_j.feat, frame_j.pos, _ = model._encode_image(
-            frame_j.img, frame_j.img_true_shape
-        )
-
-    feat1, feat2 = frame_i.feat, frame_j.feat
-    pos1, pos2 = frame_i.pos, frame_j.pos
-    shape1, shape2 = frame_i.img_true_shape, frame_j.img_true_shape
-
-    res11, res21 = decoder(model, feat1, feat2, pos1, pos2, shape1, shape2)
-    res22, res12 = decoder(model, feat2, feat1, pos2, pos1, shape2, shape1)
-    res = [res11, res21, res22, res12]
-    # 从字典中取出 3D 点、置信度、描述子及其置信度；仅取 batch=0（单图）
-    X, C, D, Q = zip(
-        *[(r["pts3d"][0], r["conf"][0], r["desc"][0], r["desc_conf"][0]) for r in res]
-    )
-    # 4xhxwxc
-    X, C, D, Q = torch.stack(X), torch.stack(C), torch.stack(D), torch.stack(Q)
-    X, C, D, Q = downsample(X, C, D, Q)
-    return X, C, D, Q
-
-
-# NOTE: Assumes img shape the same
+# 仅在本文件mast3r_utils.py中使用
 @torch.inference_mode
 def mast3r_decode_symmetric_batch(
         model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
@@ -186,6 +150,7 @@ def mast3r_decode_symmetric_batch(
     return X, C, D, Q
 
 
+# main.py使用，初始化使用一次
 @torch.inference_mode
 def mast3r_inference_mono(model, frame):
     """
@@ -218,6 +183,7 @@ def mast3r_inference_mono(model, frame):
     return Xii, Cii
 
 
+# global_opt.py使用，用于add factors
 def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j):
     """
     **对称匹配**（批量）：
@@ -275,6 +241,7 @@ def mast3r_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
     )
 
 
+# 仅在本文件mast3r_utils.py中使用
 @torch.inference_mode
 def mast3r_asymmetric_inference(model, frame_i, frame_j):
     """
@@ -307,6 +274,7 @@ def mast3r_asymmetric_inference(model, frame_i, frame_j):
     return X, C, D, Q
 
 
+# tracker.py使用，与关键帧进行不对称匹配（可利用上一帧到关键帧的索引作为初始化）
 def mast3r_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None):
     """
     **非对称匹配**：只计算 i→j 方向的匹配（常用于在线跟踪）。
@@ -345,6 +313,7 @@ def mast3r_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None):
     return idx_i2j, valid_match_j, Xii, Cii, Qii, Xji, Cji, Qji
 
 
+# 仅在本文件mast3r_utils.py中使用
 def _resize_pil_image(img, long_edge_size):
     """
     根据**长边约束**调整 PIL 图像大小（保持纵横比不变），并选择合适插值器。
@@ -369,6 +338,7 @@ def _resize_pil_image(img, long_edge_size):
     return img.resize(new_size, interp)
 
 
+# dataloader.py和frame.py中使用
 def resize_img(img, size, square_ok=False, return_transformation=False):
     """
     将原始 `numpy` 图像缩放/裁剪到 MASt3R 期望的输入尺寸（224 或 512）。
